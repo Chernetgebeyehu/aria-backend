@@ -17,6 +17,7 @@ pydantic==2.7.0           # Validates request/response data shapes
 # These are needed for long-term memory.
 # If Railway build fails due to these, remove them temporarily
 # and the server will run without memory (main.py handles this gracefully).
+numpy<2.0
 chromadb==0.5.0                  # Vector database — stores and searches embeddings
 sentence-transformers==3.0.0     # Converts text to embedding vectors
 torch==2.3.0                     # PyTorch — required by sentence-transformers
