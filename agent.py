@@ -189,33 +189,78 @@ class AgentPlanner:
         + json.dumps({k: v["description"] for k, v in TOOL_REGISTRY.items()}, indent=2)
         + """
 
-CRITICAL: Respond ONLY with a raw JSON object matching this EXACT schema:
+CRITICAL RULES — READ EVERY LINE:
+
+1. Respond ONLY with a raw JSON object. No markdown, no explanation, nothing else.
+
+2. TASK SPLITTING — THIS IS THE MOST IMPORTANT RULE:
+   When a message contains multiple actions connected by "and", "then", "also",
+   you MUST create ONE SEPARATE task per action.
+   NEVER combine two actions into a single task value.
+
+   WRONG — DO NOT DO THIS:
+   User: "call mom and send sms to dad"
+   tasks: [{"tool": "call", "value": "mom and send sms to dad"}]  ← WRONG
+
+   CORRECT — ALWAYS DO THIS:
+   User: "call mom and send sms to dad"
+   tasks: [
+     {"tool": "call", "value": "mom"},
+     {"tool": "sms",  "value": "dad"}
+   ]
+
+3. APP NAMES ARE SINGLE WORDS OR SHORT PHRASES — NOT FULL SENTENCES:
+   The "value" for open_app is ONLY the app name, nothing else.
+   WRONG: {"tool": "open_app", "value": "telegram and call mom"}  ← WRONG
+   CORRECT: {"tool": "open_app", "value": "telegram"}             ← CORRECT
+
+4. CONTACT NAMES ARE EXTRACTED CLEANLY:
+   "call mom" → value is "mom" (not "mom and ..." or "mom, please")
+   "send sms to dad" → tool: "sms", value: "dad"
+   "message John" → tool: "sms", value: "John"
+
+SCHEMA — every response must match this exactly:
 {
   "needs_planning": true,
-  "spoken_intro": "What ARIA says before starting (e.g. 'On it! Let me take care of all three.')",
+  "spoken_intro": "What ARIA says before starting (confident, natural, not robotic)",
   "tasks": [
     {
       "tool": "tool_name",
-      "value": "tool_input",
-      "description": "human readable description",
-      "fallback_tool": "alternative_tool_or_null",
-      "fallback_value": "alternative_value_or_null",
+      "value": "SINGLE clean value — app name, contact name, time, etc.",
+      "description": "human readable description of this one task",
+      "fallback_tool": null,
+      "fallback_value": null,
       "critical": false
     }
   ],
   "spoken_summary": "What ARIA says after completing everything"
 }
 
-If the request is simple (ONE action only), still return the same format with one task.
-If the request is conversational (no action needed), return:
-{"needs_planning": false, "response": "your conversational reply here"}
+If conversational (no action needed):
+{"needs_planning": false, "response": "your reply here"}
 
-RULES:
-- Order tasks logically (e.g. search before open_url)
-- Set critical=true only for tasks the user explicitly depends on
-- For fallbacks: if open_app fails, fallback to search for the same thing
-- spoken_intro should feel natural and confident, NOT robotic
-- spoken_summary should mention what was accomplished"""
+═══ EXAMPLES — STUDY THESE ═══
+
+User: "call mom and send sms to dad"
+{"needs_planning":true,"spoken_intro":"On it! Calling mom and messaging dad.","tasks":[{"tool":"call","value":"mom","description":"Call mom","fallback_tool":null,"fallback_value":null,"critical":false},{"tool":"sms","value":"dad","description":"Send SMS to dad","fallback_tool":null,"fallback_value":null,"critical":false}],"spoken_summary":"Called mom and opened a message to dad."}
+
+User: "open telegram and call mom"
+{"needs_planning":true,"spoken_intro":"Opening Telegram and calling mom.","tasks":[{"tool":"open_app","value":"telegram","description":"Open Telegram","fallback_tool":"search","fallback_value":"telegram app","critical":false},{"tool":"call","value":"mom","description":"Call mom","fallback_tool":null,"fallback_value":null,"critical":false}],"spoken_summary":"Opened Telegram and called mom."}
+
+User: "set alarm for 8am and open youtube"
+{"needs_planning":true,"spoken_intro":"Setting your alarm and opening YouTube!","tasks":[{"tool":"alarm","value":"8am","description":"Set alarm for 8am","fallback_tool":null,"fallback_value":null,"critical":false},{"tool":"open_app","value":"youtube","description":"Open YouTube","fallback_tool":"search","fallback_value":"youtube","critical":false}],"spoken_summary":"Alarm set for 8am and YouTube is opening."}
+
+User: "send a message to John then call Sarah"
+{"needs_planning":true,"spoken_intro":"Sure! Messaging John and then calling Sarah.","tasks":[{"tool":"sms","value":"John","description":"Send SMS to John","fallback_tool":null,"fallback_value":null,"critical":false},{"tool":"call","value":"Sarah","description":"Call Sarah","fallback_tool":null,"fallback_value":null,"critical":false}],"spoken_summary":"Opened a message to John and called Sarah."}
+
+User: "open whatsapp and search for flights to Dubai"
+{"needs_planning":true,"spoken_intro":"Opening WhatsApp and searching for flights.","tasks":[{"tool":"open_app","value":"whatsapp","description":"Open WhatsApp","fallback_tool":"search","fallback_value":"whatsapp","critical":false},{"tool":"search","value":"flights to Dubai","description":"Search for flights to Dubai","fallback_tool":null,"fallback_value":null,"critical":false}],"spoken_summary":"WhatsApp is open and searching for flights to Dubai."}
+
+User: "turn on wifi"
+{"needs_planning":true,"spoken_intro":"Opening WiFi settings.","tasks":[{"tool":"settings","value":"wifi","description":"Open WiFi settings","fallback_tool":null,"fallback_value":null,"critical":false}],"spoken_summary":"WiFi settings opened."}
+
+User: "what is the weather like today?"
+{"needs_planning":false,"response":"I can search that for you! Would you like me to search the current weather?"}"""
     )
 
     def __init__(self, gemini_api_key: str, openrouter_api_key: str = ""):
@@ -552,17 +597,10 @@ class AgentOrchestrator:
     - Greetings/small talk → normal chat
     """
 
-    # Keywords that suggest multi-step actions
+    # Keywords that suggest multi-step actions — checked after action verbs
     MULTI_ACTION_KEYWORDS = [
         " and ", " then ", " also ", " after that ", " plus ",
         "first ", "next ", "finally ", "lastly ", "as well"
-    ]
-
-    # Keywords that suggest pure conversation (skip agent for speed)
-    CONVERSATION_KEYWORDS = [
-        "what is", "what are", "who is", "how does", "explain",
-        "tell me about", "why does", "what do you think",
-        "help me understand", "what's the difference", "?"
     ]
 
     def __init__(
@@ -580,29 +618,51 @@ class AgentOrchestrator:
 
         The agent loop adds ~500-800ms latency vs direct chat,
         so we skip it when the request is clearly conversational.
+
+        IMPORTANT: Action signals take priority over conversation signals.
+        "call mom and what is the weather?" contains "?" (conversation signal)
+        but also "call " (action signal) — it should go through the agent.
+        We check action signals FIRST, then conversation signals.
         """
-        lower = message.lower()
+        lower = message.lower().strip()
 
-        # Pure conversation signals → skip agent
-        for kw in self.CONVERSATION_KEYWORDS:
-            if kw in lower:
-                return False
-
-        # Multi-step action signals → use agent
-        for kw in self.MULTI_ACTION_KEYWORDS:
-            if kw in lower:
-                return True
-
-        # Action verbs → use agent
+        # ── Step 1: Check for action verbs FIRST (higher priority) ────────────
+        # These indicate the user wants ARIA to DO something on the device.
+        # If any of these match, always use the agent regardless of other signals.
         action_verbs = [
             "open ", "call ", "send ", "set ", "play ", "start ",
-            "show me", "turn on", "turn off", "search for"
+            "turn on", "turn off", "search for", "message ",
+            "ring ", "dial ", "launch ", "show me", "remind me",
         ]
         for verb in action_verbs:
             if lower.startswith(verb) or f" {verb}" in lower:
                 return True
 
-        return False
+        # ── Step 2: Check for multi-step connectors ────────────────────────────
+        # These explicitly chain multiple actions together.
+        for kw in self.MULTI_ACTION_KEYWORDS:
+            if kw in lower:
+                return True
+
+        # ── Step 3: Pure conversation signals → skip agent for speed ──────────
+        # Only reach here if no action verbs were found above.
+        # "?" alone doesn't mean no action — but combined with no action verb
+        # it means it's a question ARIA should just answer.
+        conversation_only = [
+            "what is", "what are", "who is", "how does", "explain",
+            "tell me about", "why does", "what do you think",
+            "help me understand", "what's the difference",
+            "what time is it", "how are you", "what's up",
+        ]
+        for kw in conversation_only:
+            if lower.startswith(kw) or lower == kw.strip():
+                return False
+
+        # ── Step 4: Default → use agent ───────────────────────────────────────
+        # If we're not sure, the agent handles it safely.
+        # The planner will return needs_planning=false for pure chat messages
+        # and we fall back to direct chat in that case anyway.
+        return True
 
     async def run(
         self,
