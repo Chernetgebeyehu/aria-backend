@@ -1,20 +1,27 @@
 """
-ARIA FastAPI Backend Server
-===========================
-
-This is the brain of ARIA's cloud infrastructure.
+ARIA FastAPI Backend Server — Phase 2 + Phase 3 (Memory System)
+================================================================
 
 Think of this file as a telephone switchboard operator:
 - Android phones call in with messages
-- This server figures out which AI to call
-- Gets the AI's response
-- Sends it back to the phone
+- This server retrieves relevant memories from the past
+- Injects those memories into the AI's context
+- Calls the right AI (Gemini or OpenRouter)
+- Extracts new memories from the conversation
+- Sends the response back to the phone
 
 The server NEVER exposes AI API keys to the phone.
 The phone only needs to know this server's URL + secret token.
+
+What changed from Phase 2:
+- memory.py is now ACTUALLY connected and used
+- /chat endpoint now reads and stores memories automatically
+- /memory/store lets the app save a memory explicitly
+- /memory/{user_id} lets the app show what ARIA remembers
+- ChatRequest now has user_id and store_memory fields
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -27,40 +34,60 @@ import logging
 from dotenv import load_dotenv
 
 # ─── LOAD ENVIRONMENT VARIABLES ───────────────────────────────────────────────
-# This reads your .env file and puts the secrets into os.environ
-# Like opening your safe and putting the contents on your desk (privately)
+# This reads your .env file locally, and Railway env vars in production.
+# Like opening your safe and putting the contents on your desk (privately).
 load_dotenv()
 
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 SECRET_TOKEN       = os.getenv("SECRET_TOKEN", "")
 
 # ─── LOGGING SETUP ────────────────────────────────────────────────────────────
-# Logging = writing a diary of everything that happens
-# When something breaks, you read the diary to understand what went wrong
+# Logging = writing a diary of everything that happens.
+# When something breaks at 3am, you read the diary to find out why.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("aria-backend")
 
+# ─── MEMORY SYSTEM SETUP ──────────────────────────────────────────────────────
+# We try to load the memory system.
+# If it fails (ChromaDB not installed, etc.), we run WITHOUT memory.
+# This means the server still works — it just won't remember anything.
+# Think of it like a person who works fine even with amnesia —
+# they can still answer questions, they just won't remember past conversations.
+
+MEMORY_AVAILABLE = False
+memory_manager = None
+memory_extractor = None
+
+try:
+    from memory import get_memory_manager, get_memory_extractor
+    memory_manager = get_memory_manager()
+    memory_extractor = get_memory_extractor()
+    MEMORY_AVAILABLE = True
+    logger.info("✅ Memory system loaded successfully.")
+except Exception as e:
+    logger.warning(f"⚠️  Memory system unavailable: {e}")
+    logger.warning("    Server will run without persistent memory.")
+
 # ─── FASTAPI APP ──────────────────────────────────────────────────────────────
-# This creates the web server application
-# Think of it as building the building before putting rooms in it
+# This creates the web server application.
+# Think of it as building the building before putting rooms in it.
 app = FastAPI(
     title="ARIA Backend",
     description="Secure AI orchestration layer for ARIA Android assistant",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # ─── CORS MIDDLEWARE ──────────────────────────────────────────────────────────
-# CORS = Cross-Origin Resource Sharing
-# Without this, browsers block requests from unknown sources
-# We're restrictive: only our Android app should talk to this server
+# CORS = Cross-Origin Resource Sharing.
+# Without this, browsers block requests from unknown sources.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # In production, change to your specific domain
-    allow_methods=["POST", "GET"],
+    allow_origins=["*"],
+    allow_methods=["POST", "GET", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -73,9 +100,10 @@ GEMINI_URL   = (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-# This is what tells the AI how to behave as ARIA
-# Moving it to the server means you can update ARIA's personality
-# without releasing a new version of the Android app
+# This is what tells the AI how to behave as ARIA.
+# Living on the server means you can update ARIA's personality
+# without releasing a new version of the Android app.
+# That's a huge engineering advantage.
 ARIA_SYSTEM_PROMPT = """
 You are ARIA (Adaptive Reasoning and Intelligent Assistant), a smart Android AI assistant.
 
@@ -111,54 +139,69 @@ open_url       → value: full URL
 User: "Open YouTube"
 {"type":"action","spoken":"Opening YouTube for you!","actions":[{"tool":"open_app","value":"youtube"}]}
 
+User: "Call mom"
+{"type":"action","spoken":"Calling mom now.","actions":[{"tool":"call","value":"mom"}]}
+
 User: "What is the capital of Ethiopia?"
 {"type":"chat","text":"The capital of Ethiopia is Addis Ababa (አዲስ አበባ), which means New Flower in Amharic."}
 """.strip()
 
-# ─── REQUEST/RESPONSE MODELS ──────────────────────────────────────────────────
-# Pydantic models define exactly what shape data must be in
+
+# ─── REQUEST / RESPONSE MODELS ────────────────────────────────────────────────
+# Pydantic models define exactly what shape data must be in.
 # If the phone sends wrong data, FastAPI automatically rejects it
-# Like a bouncer checking IDs at the door
+# with a clear error message. Like a bouncer checking IDs at the door.
 
 class ChatRequest(BaseModel):
     """What the Android app sends to the server."""
-    message: str                    # The user's text/voice input
-    screen_context: Optional[str]   # Current screen content (for safety checks)
-    model: Optional[str] = "gemini" # Which AI to use: "gemini" or "openrouter"
+    message: str                              # The user's text/voice input
+    screen_context: Optional[str] = None      # Current screen content (for safety checks)
+    model: Optional[str] = "gemini"           # Which AI to use: "gemini" or "openrouter"
     openrouter_model: Optional[str] = "google/gemma-3-4b-it:free"
-    history: Optional[list] = []    # Recent conversation turns
-    token: str                      # Secret token - must match SECRET_TOKEN
+    history: Optional[list] = []              # Recent conversation turns (short-term)
+    token: str                                # Secret token — must match SECRET_TOKEN
+    user_id: Optional[str] = "aria_user_default"   # Which user this is (for memory)
+    store_memory: Optional[bool] = True       # Whether to save memories from this chat
 
 class ChatResponse(BaseModel):
     """What the server sends back to the Android app."""
-    response: str    # The AI's JSON response (same format as before)
-    provider: str    # Which AI was used ("gemini" or "openrouter")
-    latency_ms: int  # How long it took in milliseconds
+    response: str           # The AI's JSON response
+    provider: str           # Which AI was used ("gemini" or "openrouter")
+    latency_ms: int         # How long it took in milliseconds
+    memories_retrieved: int = 0   # How many memories were used as context
+    memories_stored: int = 0      # How many new memories were saved
+
+class MemoryStoreRequest(BaseModel):
+    """Request to explicitly store a memory."""
+    content: str
+    memory_type: Optional[str] = "general"
+    user_id: Optional[str] = "aria_user_default"
+    token: str
 
 class HealthResponse(BaseModel):
     """Status check response."""
     status: str
     gemini_configured: bool
     openrouter_configured: bool
+    memory_available: bool
     version: str
 
+
 # ─── AUTHENTICATION ───────────────────────────────────────────────────────────
-# This checks every request to make sure it comes from our Android app
-# It's like checking a password before letting someone in
+# This checks every request to make sure it comes from our Android app.
+# Your server URL is public — anyone can find it.
+# Without this token, anyone could use your server and drain your API credits.
 
 def verify_token(request_token: str) -> bool:
     """
     Verify the secret token from the Android app.
-    
-    Why do we need this?
-    Your server URL will be public (anyone can find it).
-    Without a token, anyone could use your server and drain your API credits.
-    With a token, only your Android app (which has the token hardcoded) can use it.
+    If no SECRET_TOKEN is configured in env vars, auth is disabled (dev mode).
     """
     if not SECRET_TOKEN:
-        logger.warning("No SECRET_TOKEN configured — authentication disabled")
+        logger.warning("No SECRET_TOKEN configured — auth disabled (dev mode)")
         return True
     return request_token == SECRET_TOKEN
+
 
 # ─── AI PROVIDER FUNCTIONS ────────────────────────────────────────────────────
 
@@ -169,23 +212,24 @@ async def call_gemini(
 ) -> str:
     """
     Call Google's Gemini AI.
-    
-    async means this function can pause while waiting for the network
+
+    'async' means this function can pause while waiting for the network
     and let other requests be handled in the meantime.
     Like a waiter who takes 5 orders before going to the kitchen,
-    instead of waiting for one order to be cooked before taking the next.
+    instead of waiting for one meal to be cooked before taking the next.
     """
     if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="Gemini API key not configured")
+        raise HTTPException(status_code=500, detail="Gemini API key not configured on server.")
 
-    # Build the message with optional screen context
+    # Build the final message — attach screen context if we have it
     final_message = message
     if screen_context:
         final_message = f"{message}\n\nScreen context:\n{screen_context[:1200]}"
 
     # Build conversation history in Gemini format
+    # We only send the last 20 items (10 turns) to save tokens
     contents = []
-    for turn in history[-20:]:  # Max 10 turns (20 = user+model pairs)
+    for turn in history[-20:]:
         contents.append(turn)
 
     # Add the new user message
@@ -208,7 +252,6 @@ async def call_gemini(
     }
 
     # Make the HTTP request to Gemini
-    # httpx is like the fetch() in JavaScript — it makes HTTP requests
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
             f"{GEMINI_URL}?key={GEMINI_API_KEY}",
@@ -218,14 +261,18 @@ async def call_gemini(
 
     if response.status_code == 429:
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
-    
+
     if not response.is_success:
-        error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-        error_msg = error_data.get("error", {}).get("message", f"Error {response.status_code}")
+        error_data = {}
+        try:
+            error_data = response.json()
+        except Exception:
+            pass
+        error_msg = error_data.get("error", {}).get("message", f"Gemini error {response.status_code}")
         logger.error(f"Gemini error: {error_msg}")
         raise HTTPException(status_code=response.status_code, detail=error_msg)
 
-    # Parse the response
+    # Parse the response — dig into the nested JSON structure Gemini returns
     data = response.json()
     raw_text = (
         data["candidates"][0]["content"]["parts"][0]["text"]
@@ -243,10 +290,10 @@ async def call_openrouter(
     """
     Call OpenRouter — a service that gives access to many AI models
     through one single API. Like a broker who can connect you to
-    hundreds of AI models from one place.
+    hundreds of AI models from one place (Gemma, Llama, Mistral, Claude, etc.)
     """
     if not OPENROUTER_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
+        raise HTTPException(status_code=500, detail="OpenRouter API key not configured on server.")
 
     final_message = message
     if screen_context:
@@ -300,10 +347,12 @@ async def call_openrouter(
     return strip_markdown(raw_text)
 
 
+# ─── HELPER FUNCTIONS ─────────────────────────────────────────────────────────
+
 def strip_markdown(text: str) -> str:
     """
     Remove markdown code fences if the AI wrapped the JSON in them.
-    Some models do this even when told not to.
+    Some models do this even when told not to — this is the safety net.
     """
     text = text.strip()
     if text.startswith("```"):
@@ -315,67 +364,97 @@ def strip_markdown(text: str) -> str:
 
 
 def build_error_response(message: str) -> str:
-    """Build a safe JSON error response in ARIA's format."""
+    """Build a safe JSON error response in ARIA's chat format."""
     safe = message.replace('"', "'")
     return json.dumps({"type": "chat", "text": safe})
 
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
-# These are the "rooms" in your server building
-# Each endpoint is a URL your Android app can call
+# These are the "rooms" in your server building.
+# Each endpoint is a URL your Android app can call.
 
 @app.get("/", response_model=HealthResponse)
 async def health_check():
     """
     Health check endpoint.
-    
-    Like a "Are you there?" ping. Your monitoring system can call this
-    every minute to make sure the server is alive.
-    
+    Like a "Are you there?" ping.
     URL: GET https://your-server.com/
     """
     return HealthResponse(
         status="online",
         gemini_configured=bool(GEMINI_API_KEY),
         openrouter_configured=bool(OPENROUTER_API_KEY),
-        version="1.0.0"
+        memory_available=MEMORY_AVAILABLE,
+        version="2.0.0"
     )
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
-    Main chat endpoint. This is what your Android app calls.
-    
-    URL: POST https://your-server.com/chat
-    Body: ChatRequest JSON
-    Returns: ChatResponse JSON
-    
-    The flow:
+    Main chat endpoint. This is what your Android app calls for every message.
+
+    The full flow with memory:
     1. Verify the secret token
-    2. Route to the right AI provider
-    3. Get the AI response
-    4. Return it to the Android app
+    2. Retrieve relevant past memories for this user
+    3. Inject those memories into the message context
+    4. Call the right AI provider (Gemini or OpenRouter)
+    5. Extract new memories from what the user just said
+    6. Return the AI response + memory stats to the phone
+
+    URL: POST https://your-server.com/chat
     """
-    # Step 1: Verify token
+
+    # ── STEP 1: Verify token ──────────────────────────────────────────────────
     if not verify_token(request.token):
         logger.warning("Unauthorized request — wrong token")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Step 2: Log the request (never log the full message for privacy)
     logger.info(
         f"Chat request | provider={request.model} | "
+        f"user={request.user_id} | "
         f"msg_length={len(request.message)} | "
         f"has_screen={bool(request.screen_context)}"
     )
 
     start_time = time.time()
+    memories_retrieved = 0
+    memories_stored = 0
 
-    # Step 3: Route to the right AI
+    # ── STEP 2: Retrieve relevant memories ───────────────────────────────────
+    # This is RAG (Retrieval-Augmented Generation).
+    # We search ARIA's long-term memory for anything related to this message.
+    # Example: User says "remind me of my meeting" →
+    #   Memory system finds "User has a meeting on Monday at 3pm" →
+    #   That memory gets added to the message context →
+    #   AI responds knowing about the meeting.
+    message_with_memory = request.message
+
+    if MEMORY_AVAILABLE and memory_manager and request.user_id:
+        try:
+            relevant_memories = memory_manager.retrieve_relevant(
+                user_id=request.user_id,
+                query=request.message,
+                max_results=5
+            )
+            memories_retrieved = len(relevant_memories)
+
+            if relevant_memories:
+                # Format memories as text and prepend to the message
+                # The AI sees this as part of the user's message context
+                memory_context = memory_manager.format_for_context(relevant_memories)
+                if memory_context:
+                    message_with_memory = f"{memory_context}\n\nUser: {request.message}"
+                    logger.info(f"Injected {memories_retrieved} memories into context.")
+
+        except Exception as e:
+            logger.warning(f"Memory retrieval failed (non-fatal): {e}")
+
+    # ── STEP 3: Call the AI ───────────────────────────────────────────────────
     try:
         if request.model == "gemini":
             ai_response = await call_gemini(
-                message=request.message,
+                message=message_with_memory,
                 history=request.history or [],
                 screen_context=request.screen_context
             )
@@ -383,7 +462,7 @@ async def chat(request: ChatRequest):
 
         elif request.model == "openrouter":
             ai_response = await call_openrouter(
-                message=request.message,
+                message=message_with_memory,
                 history=request.history or [],
                 model=request.openrouter_model or "google/gemma-3-4b-it:free",
                 screen_context=request.screen_context
@@ -391,34 +470,120 @@ async def chat(request: ChatRequest):
             provider = "openrouter"
 
         else:
-            raise HTTPException(status_code=400, detail=f"Unknown model: {request.model}")
+            raise HTTPException(status_code=400, detail=f"Unknown model: {request.model}. Use 'gemini' or 'openrouter'.")
 
     except HTTPException:
-        raise  # Re-raise HTTP exceptions as-is
+        raise   # Re-raise HTTP exceptions as-is
 
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
+        logger.error(f"Unexpected AI error: {e}", exc_info=True)
         ai_response = build_error_response(f"Server error: {str(e)[:100]}")
         provider = "error"
 
+    # ── STEP 4: Extract and store new memories ────────────────────────────────
+    # After the conversation, we look at what the user said and ask:
+    # "Is there anything worth remembering here?"
+    # Example: "My name is Cherinet" → worth storing as a fact.
+    # Example: "Open YouTube" → not worth storing.
+    if MEMORY_AVAILABLE and memory_manager and memory_extractor and request.store_memory and request.user_id:
+        try:
+            new_memories = memory_extractor.extract_memories(
+                user_message=request.message,
+                ai_response=ai_response
+            )
+            for mem in new_memories:
+                memory_manager.store_memory(
+                    user_id=request.user_id,
+                    content=mem["content"],
+                    memory_type=mem["memory_type"]
+                )
+                memories_stored += 1
+
+            if memories_stored > 0:
+                logger.info(f"Stored {memories_stored} new memories for user {request.user_id}.")
+
+        except Exception as e:
+            logger.warning(f"Memory storage failed (non-fatal): {e}")
+
     latency = int((time.time() - start_time) * 1000)
-    logger.info(f"Response sent | provider={provider} | latency={latency}ms")
+    logger.info(f"Response sent | provider={provider} | latency={latency}ms | "
+                f"memories_retrieved={memories_retrieved} | memories_stored={memories_stored}")
 
     return ChatResponse(
         response=ai_response,
         provider=provider,
-        latency_ms=latency
+        latency_ms=latency,
+        memories_retrieved=memories_retrieved,
+        memories_stored=memories_stored
     )
+
+
+@app.post("/memory/store")
+async def store_memory_endpoint(request: MemoryStoreRequest):
+    """
+    Explicitly store a memory from the app.
+    This is called when the user taps "Remember this" on a message.
+    URL: POST https://your-server.com/memory/store
+    """
+    if not verify_token(request.token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not MEMORY_AVAILABLE or not memory_manager:
+        raise HTTPException(status_code=503, detail="Memory system not available.")
+
+    memory_id = memory_manager.store_memory(
+        user_id=request.user_id or "aria_user_default",
+        content=request.content,
+        memory_type=request.memory_type or "general"
+    )
+
+    return {"success": True, "memory_id": memory_id}
+
+
+@app.get("/memory/{user_id}")
+async def get_memories(user_id: str, token: str):
+    """
+    Get all stored memories for a user.
+    The app calls this to show the memory list in settings.
+    URL: GET https://your-server.com/memory/{user_id}?token=your_token
+    """
+    if not verify_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not MEMORY_AVAILABLE or not memory_manager:
+        return {"memories": [], "total": 0, "memory_available": False}
+
+    memories = memory_manager.get_all_memories(user_id)
+    return {
+        "memories": memories,
+        "total": len(memories),
+        "memory_available": True
+    }
+
+
+@app.delete("/memory/{user_id}")
+async def clear_memories(user_id: str, token: str):
+    """
+    Delete all memories for a user.
+    The app calls this when user taps "Clear ARIA's memory."
+    URL: DELETE https://your-server.com/memory/{user_id}?token=your_token
+    """
+    if not verify_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not MEMORY_AVAILABLE or not memory_manager:
+        return {"success": False, "reason": "Memory system not available."}
+
+    memory_manager.clear_user_memories(user_id)
+    return {"success": True, "cleared_for": user_id}
 
 
 @app.post("/analyze-security")
 async def analyze_security(request: ChatRequest):
     """
     Dedicated security analysis endpoint.
-    
     Sends screen content to AI specifically for security checking.
-    Separated from /chat so we can apply different AI models/prompts
-    for security tasks in the future.
+    URL: POST https://your-server.com/analyze-security
     """
     if not verify_token(request.token):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -438,15 +603,18 @@ Content to analyze:
         model=request.model,
         openrouter_model=request.openrouter_model,
         history=[],
-        token=request.token
+        token=request.token,
+        user_id=request.user_id,
+        store_memory=False   # Don't store memories from security scans
     )
 
     return await chat(modified_request)
 
 
 # ─── ERROR HANDLERS ───────────────────────────────────────────────────────────
-# What to do when things go wrong
-# Like having a plan for when the fire alarm goes off
+# What to do when things go wrong.
+# Like having a fire escape plan — you hope you never need it,
+# but you are VERY glad it's there when you do.
 
 @app.exception_handler(404)
 async def not_found(request: Request, exc):
@@ -468,24 +636,26 @@ async def server_error(request: Request, exc):
 
 @app.on_event("startup")
 async def startup():
-    logger.info("=== ARIA Backend starting up ===")
-    logger.info(f"Gemini configured: {bool(GEMINI_API_KEY)}")
+    logger.info("=== ARIA Backend v2.0 starting up ===")
+    logger.info(f"Gemini configured:    {bool(GEMINI_API_KEY)}")
     logger.info(f"OpenRouter configured: {bool(OPENROUTER_API_KEY)}")
     logger.info(f"Auth token configured: {bool(SECRET_TOKEN)}")
-    logger.info("================================")
+    logger.info(f"Memory system active:  {MEMORY_AVAILABLE}")
+    logger.info("=====================================")
 
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("ARIA Backend shutting down")
 
 
-# ─── RUN THE SERVER ───────────────────────────────────────────────────────────
-# This runs the server when you execute `python main.py` directly
+# ─── RUN LOCALLY ──────────────────────────────────────────────────────────────
+# This runs only when you execute `python main.py` directly on your PC.
+# On Railway, the Procfile handles starting the server instead.
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",   # Listen on all network interfaces
-        port=8000,         # Port number
-        reload=True        # Auto-restart when code changes (dev mode only)
+        host="0.0.0.0",
+        port=8000,
+        reload=True   # Auto-restart when you save changes (dev mode only!)
     )
