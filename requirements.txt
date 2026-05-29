@@ -1,28 +1,5 @@
-# ARIA Backend — Python Dependencies
-# =====================================
-# Install all with: pip install -r requirements.txt
-# Why pinned versions? So your server works identically everywhere.
-
-# ─── CORE SERVER ──────────────────────────────────────────────────────────────
-fastapi==0.111.0          # The web framework
-uvicorn[standard]==0.29.0 # The server engine that runs FastAPI
-httpx==0.27.0             # Makes async HTTP requests to Gemini/OpenRouter
-python-dotenv==1.0.1      # Reads .env file for secrets
-pydantic==2.7.0           # Validates request/response data shapes
-
-# ─── MEMORY SYSTEM (Phase 3, unchanged) ──────────────────────────────────────
-# numpy<2.0 is required because chromadb==0.5.0 uses np.float_ which was
-# removed in NumPy 2.0. This pin keeps Railway from installing the wrong version.
-numpy<2.0
-chromadb==0.5.0                  # Vector database — stores and searches embeddings
-sentence-transformers==3.0.0     # Converts text to embedding vectors
-torch==2.3.0                     # PyTorch — required by sentence-transformers
-
-# ─── AGENT SYSTEM (Phase 4) ───────────────────────────────────────────────────
-# No new dependencies! The agent.py system uses:
-# - httpx (already in core above) for calling Gemini/OpenRouter as the planner
-# - json, dataclasses, asyncio — all built into Python standard library
-# - The existing memory system for remember/recall tools
-#
-# This means Phase 4 adds ZERO new pip dependencies.
-# Just copy agent.py to your aria-backend folder and deploy.
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+httpx==0.27.0
+python-dotenv==1.0.1
+pydantic==2.7.0
