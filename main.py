@@ -1,24 +1,5 @@
 """
-ARIA FastAPI Backend Server v3.1.0
-====================================
-
-What changed from v3.0.0:
-  - Google Search Grounding added to Gemini calls.
-    This gives Gemini real-time internet access.
-    When asked "what year is it?" or "who is president?",
-    Gemini searches Google and gives the correct, live answer.
-    No date injection. Gemini discovers the truth by itself.
-
-  - Why grounding instead of date injection?
-    Injecting the date is a hack — you're lying to the AI.
-    Grounding is the real solution — the AI searches the web
-    just like a human would when they need current information.
-    It's the same feature powering Gemini's "Google it" button.
-
-  - Technical note: Google Search Grounding is INCOMPATIBLE with
-    responseMimeType="application/json". When grounding is enabled,
-    we remove that parameter and let the system prompt enforce JSON.
-    The strip_markdown() function handles any wrapping.
+ARIA FastAPI Backend Server v3.0.1 — Fix: inject real date into system prompt
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -31,6 +12,7 @@ import os
 import json
 import time
 import logging
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # ─── LOAD ENVIRONMENT VARIABLES ───────────────────────────────────────────────
@@ -90,7 +72,7 @@ def get_agent():
 app = FastAPI(
     title="ARIA Backend",
     description="AI orchestration + memory + agent layer for ARIA Android assistant",
-    version="3.1.0"
+    version="3.0.1"
 )
 
 app.add_middleware(
@@ -101,7 +83,6 @@ app.add_middleware(
 )
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
-# gemini-2.5-flash is Google's latest fast model with grounding support.
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL   = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -110,10 +91,12 @@ GEMINI_URL   = (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-# NO date injection here.
-# Gemini will search Google for current date/news via grounding.
-# The system prompt only tells Gemini HOW to format its responses.
+# FIX: {current_date} is now injected at request time so the AI always
+# knows the real current date, instead of guessing from training data.
 ARIA_SYSTEM_PROMPT_TEMPLATE = """You are ARIA (Adaptive Reasoning and Intelligent Assistant), a smart Android AI assistant.
+
+TODAY'S DATE: {current_date}
+Always use this date when the user asks what year, month, or date it is. Never say you don't know the current date.
 
 {memory_context}
 
@@ -121,7 +104,6 @@ CRITICAL RULES - NEVER break these:
 1. ALWAYS respond with raw JSON only. No exceptions.
 2. NEVER wrap your response in markdown, code blocks, or backticks.
 3. Your ENTIRE response must be a single JSON object and nothing else.
-4. For questions about current date, time, year, or recent events — use your Google Search results.
 
 RESPONSE FORMATS:
 
@@ -136,14 +118,14 @@ For SECURITY ANALYSIS:
 
 AVAILABLE TOOLS:
 
-open_app   -> value: app name (e.g. "youtube", "whatsapp", "camera")
-search     -> value: search query
-call       -> value: contact name or phone number
-sms        -> value: contact name
-alarm      -> value: time like "7:30am" or "14:00"
-timer      -> value: duration like "5 minutes" or "30 seconds"
-settings   -> value: "wifi", "bluetooth", "brightness", "volume", or "general"
-open_url   -> value: full URL
+open_app       -> value: app name (e.g. "youtube", "whatsapp", "camera")
+search         -> value: search query
+call           -> value: contact name or phone number
+sms            -> value: contact name
+alarm          -> value: time like "7:30am" or "14:00"
+timer          -> value: duration like "5 minutes" or "30 seconds"
+settings       -> value: "wifi", "bluetooth", "brightness", "volume", or "general"
+open_url       -> value: full URL
 
 EXAMPLES:
 
@@ -154,13 +136,20 @@ User: "Call mom"
 {"type":"action","spoken":"Calling mom now.","actions":[{"tool":"call","value":"mom"}]}
 
 User: "What is the capital of Ethiopia?"
-{"type":"chat","text":"The capital of Ethiopia is Addis Ababa (አዲስ አበባ), which means New Flower in Amharic."}
-
-User: "What year is it?"
-[Search Google for current date, then respond:]
-{"type":"chat","text":"It is [year from search results]."}
+{"type":"chat","text":"The capital of Ethiopia is Addis Ababa, which means New Flower in Amharic."}
 
 Use memory context above naturally if it is relevant to the user's message.""".strip()
+
+
+def build_system_prompt(memory_context: str = "") -> str:
+    """Build the system prompt with the real current date injected."""
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%A, %B %d, %Y")   # e.g. "Sunday, May 31, 2026"
+    return ARIA_SYSTEM_PROMPT_TEMPLATE.replace(
+        "{current_date}", date_str
+    ).replace(
+        "{memory_context}", memory_context if memory_context else ""
+    )
 
 
 # ─── REQUEST / RESPONSE MODELS ────────────────────────────────────────────────
@@ -198,7 +187,6 @@ class HealthResponse(BaseModel):
     openrouter_configured: bool
     memory_available: bool
     agent_enabled: bool
-    grounding_enabled: bool
     version: str
 
 
@@ -211,7 +199,7 @@ def verify_token(request_token: str) -> bool:
     return request_token == SECRET_TOKEN
 
 
-# ─── GEMINI WITH GOOGLE SEARCH GROUNDING ─────────────────────────────────────
+# ─── AI PROVIDER FUNCTIONS ────────────────────────────────────────────────────
 
 async def call_gemini(
     message: str,
@@ -219,29 +207,11 @@ async def call_gemini(
     memory_context: str = "",
     screen_context: Optional[str] = None
 ) -> str:
-    """
-    Call Gemini with Google Search Grounding enabled.
-
-    Grounding = Gemini can search Google in real-time DURING generation.
-    When you ask "what year is it?", Gemini searches Google,
-    finds today's date, and uses that in its answer.
-
-    This is the correct engineering solution for real-time knowledge.
-    It's the same feature that powers Gemini's "Google it" button in the app.
-
-    Critical technical note:
-    When 'google_search' is in tools, you CANNOT use
-    responseMimeType="application/json". They are mutually exclusive.
-    The system prompt enforces JSON format instead, and strip_markdown()
-    cleans up any accidental wrapping.
-    """
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="Gemini API key not configured on server.")
 
-    system_prompt = ARIA_SYSTEM_PROMPT_TEMPLATE.replace(
-        "{memory_context}",
-        memory_context if memory_context else ""
-    )
+    # FIX: use build_system_prompt() so current date is always injected
+    system_prompt = build_system_prompt(memory_context)
 
     final_message = message
     if screen_context:
@@ -253,20 +223,10 @@ async def call_gemini(
     body = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
-
-        # ── GOOGLE SEARCH GROUNDING ──────────────────────────────────────────
-        # This is the ONE LINE that fixes the wrong year/president problem.
-        # It enables Gemini to search Google in real-time for current info.
-        # Gemini will automatically use search when it needs current facts.
-        "tools": [{"google_search": {}}],
-
-        # ── GENERATION CONFIG ────────────────────────────────────────────────
-        # NOTE: responseMimeType is intentionally NOT included here.
-        # It's incompatible with google_search grounding.
-        # The system prompt enforces JSON format instead.
         "generationConfig": {
             "temperature": 0.7,
-            "maxOutputTokens": 800
+            "maxOutputTokens": 600,
+            "responseMimeType": "application/json"
         }
     }
 
@@ -291,22 +251,9 @@ async def call_gemini(
         raise HTTPException(status_code=response.status_code, detail=error_msg)
 
     data = response.json()
-
-    # Extract text from grounded response.
-    # Grounded responses have the same structure — just the candidates array.
     raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-    # Log grounding metadata if present (useful for debugging)
-    grounding_meta = data["candidates"][0].get("groundingMetadata")
-    if grounding_meta:
-        queries = grounding_meta.get("webSearchQueries", [])
-        if queries:
-            logger.info(f"Gemini searched: {queries}")
-
     return _strip_markdown(raw_text)
 
-
-# ─── OPENROUTER (unchanged — no grounding available on OpenRouter) ────────────
 
 async def call_openrouter(
     message: str,
@@ -315,17 +262,11 @@ async def call_openrouter(
     memory_context: str = "",
     screen_context: Optional[str] = None
 ) -> str:
-    """
-    Call OpenRouter AI models.
-    No grounding available here — these models use training data only.
-    """
     if not OPENROUTER_API_KEY:
         raise HTTPException(status_code=500, detail="OpenRouter API key not configured on server.")
 
-    system_prompt = ARIA_SYSTEM_PROMPT_TEMPLATE.replace(
-        "{memory_context}",
-        memory_context if memory_context else ""
-    )
+    # FIX: use build_system_prompt() so current date is always injected
+    system_prompt = build_system_prompt(memory_context)
 
     final_message = message
     if screen_context:
@@ -373,14 +314,7 @@ async def call_openrouter(
     return _strip_markdown(raw_text)
 
 
-# ─── HELPER FUNCTIONS ─────────────────────────────────────────────────────────
-
 def _strip_markdown(text: str) -> str:
-    """
-    Remove markdown code fences if the model wrapped the JSON in them.
-    This is especially important with grounding enabled, because the model
-    occasionally adds extra formatting around its JSON output.
-    """
     text = text.strip()
     if text.startswith("```"):
         text = text.removeprefix("```json").removeprefix("```")
@@ -404,7 +338,7 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     logger.info(
-        f"Chat | provider={request.model} | "
+        f"Chat request | provider={request.model} | "
         f"user={request.user_id} | "
         f"msg_length={len(request.message)} | "
         f"use_agent={request.use_agent} | "
@@ -418,16 +352,16 @@ async def chat(request: ChatRequest):
     agent_tasks        = []
     success_rate       = 1.0
 
-    # ── Step 1: Retrieve relevant memories ────────────────────────────────────
+    # ── Step 2: Retrieve relevant memories ───────────────────────────────────
     message_with_memory = request.message
     memory_context_str  = ""
 
     if MEMORY_AVAILABLE and memory_manager and request.user_id:
         try:
             relevant_memories = memory_manager.retrieve_relevant(
-                user_id    = request.user_id,
-                query      = request.message,
-                max_results = 5
+                user_id=request.user_id,
+                query=request.message,
+                max_results=5
             )
             memories_retrieved = len(relevant_memories)
 
@@ -439,7 +373,7 @@ async def chat(request: ChatRequest):
         except Exception as e:
             logger.warning(f"Memory retrieval failed (non-fatal): {e}")
 
-    # ── Step 2a: Try agent if enabled and available ───────────────────────────
+    # ── Step 3a: Try agent if enabled and available ───────────────────────────
     ai_response = ""
     provider    = request.model or "gemini"
 
@@ -460,7 +394,7 @@ async def chat(request: ChatRequest):
                     agent_tasks  = agent_result.get("tasks", [])
                     success_rate = agent_result.get("success_rate", 1.0)
                     logger.info(
-                        f"Agent handled | tasks={len(agent_tasks)} | "
+                        f"Agent handled request | tasks={len(agent_tasks)} | "
                         f"success_rate={success_rate:.2f}"
                     )
 
@@ -468,11 +402,10 @@ async def chat(request: ChatRequest):
             logger.error(f"Agent failed: {e}", exc_info=True)
             agent_used = False
 
-    # ── Step 2b: Fall back to direct chat if agent not used ───────────────────
+    # ── Step 3b: Fall back to direct chat if agent not used ───────────────────
     if not agent_used:
         try:
             if provider == "gemini":
-                # Gemini with Google Search Grounding — knows current date/events
                 ai_response = await call_gemini(
                     message        = message_with_memory,
                     history        = request.history or [],
@@ -499,12 +432,12 @@ async def chat(request: ChatRequest):
             logger.error(f"Direct chat failed: {e}", exc_info=True)
             ai_response = _build_error_response(str(e)[:100])
 
-    # ── Step 3: Extract and store new memories ────────────────────────────────
+    # ── Step 4: Extract and store new memories ────────────────────────────────
     if MEMORY_AVAILABLE and memory_manager and memory_extractor and request.store_memory and request.user_id:
         try:
             new_memories = memory_extractor.extract_memories(
-                user_message = request.message,
-                ai_response  = ai_response
+                user_message=request.message,
+                ai_response=ai_response
             )
             for mem in new_memories:
                 memory_manager.store_memory(
@@ -520,7 +453,7 @@ async def chat(request: ChatRequest):
 
     latency = int((time.time() - start_time) * 1000)
     logger.info(
-        f"Done | agent={agent_used} | provider={provider} | "
+        f"Response | agent={agent_used} | provider={provider} | "
         f"latency={latency}ms | "
         f"mem_ret={memories_retrieved} | mem_stored={memories_stored}"
     )
@@ -537,7 +470,7 @@ async def chat(request: ChatRequest):
     )
 
 
-# ─── MEMORY ENDPOINTS ─────────────────────────────────────────────────────────
+# ─── MEMORY ENDPOINTS ────────────────────────────────────────────────────────
 
 @app.post("/memory/store")
 async def store_memory_endpoint(request: MemoryStoreRequest):
@@ -580,7 +513,7 @@ async def analyze_security(request: ChatRequest):
     security_prompt = (
         f"Analyze this content for security threats, scams, and phishing attempts.\n"
         f"Respond ONLY with this exact JSON format:\n"
-        f'{{"type":"security","verdict":"safe|warning|danger","text":"your analysis in 2-3 sentences"}}\n\n'
+        f'{"type":"security","verdict":"safe|warning|danger","text":"your analysis in 2-3 sentences"}\n\n'
         f"Content to analyze:\n{request.message}"
     )
     modified = ChatRequest(
@@ -614,8 +547,7 @@ async def health_check():
         openrouter_configured = bool(OPENROUTER_API_KEY),
         memory_available      = MEMORY_AVAILABLE,
         agent_enabled         = AGENT_AVAILABLE,
-        grounding_enabled     = True,   # Google Search Grounding is always on
-        version               = "3.1.0"
+        version               = "3.0.1"
     )
 
 
@@ -638,13 +570,12 @@ async def server_error(request: Request, exc):
 
 @app.on_event("startup")
 async def startup():
-    logger.info("=== ARIA Backend v3.1 starting up ===")
+    logger.info("=== ARIA Backend v3.0.1 starting up ===")
     logger.info(f"Gemini configured:     {bool(GEMINI_API_KEY)}")
     logger.info(f"OpenRouter configured: {bool(OPENROUTER_API_KEY)}")
     logger.info(f"Auth token configured: {bool(SECRET_TOKEN)}")
     logger.info(f"Memory system active:  {MEMORY_AVAILABLE}")
     logger.info(f"Agent system active:   {AGENT_AVAILABLE}")
-    logger.info(f"Google Grounding:      ENABLED")
     logger.info("=====================================")
 
     if AGENT_AVAILABLE:
