@@ -102,19 +102,28 @@ app.add_middleware(
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL   = (
+    GEMINI_URL   = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
-)
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+    )
+    OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-# The {memory_context} placeholder gets filled in at request time.
-# This means ARIA's long-term memories appear naturally in her context.
+    def get_system_prompt() -> str:
+    """
+    Build the system prompt with today's actual date injected.
+    Called fresh for every request so ARIA always knows the real date.
+    This fixes the 'wrong year' bug — Gemini needs to be TOLD the date.
+    """
+    from datetime import datetime
+    today = datetime.now().strftime("%A, %B %d, %Y")
+    current_year = datetime.now().year
 
-ARIA_SYSTEM_PROMPT_TEMPLATE = """You are ARIA (Adaptive Reasoning and Intelligent Assistant), a smart Android AI assistant.
+    return f"""
+    You are ARIA (Adaptive Reasoning and Intelligent Assistant), a smart Android AI assistant.
 
-{memory_context}
+    IMPORTANT: Today's date is {today}. The current year is {current_year}.
+    Always use this date when answering questions about time, dates, or current events.
+    Never say it is 2024. It is {current_year}.
 
 CRITICAL RULES - NEVER break these:
 1. ALWAYS respond with raw JSON only. No exceptions.
@@ -232,7 +241,7 @@ async def call_gemini(
     contents.append({"role": "user", "parts": [{"text": final_message}]})
 
     body = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "systemInstruction": {"parts": [{"text": get_system_prompt()}]},
         "contents": contents,
         "generationConfig": {
             "temperature": 0.7,
